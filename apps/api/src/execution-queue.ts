@@ -13,7 +13,17 @@ export interface ExecutionResult {
   activityId?: string;
 }
 
-export type PreCheckResult = "found" | "not_found" | "network_error";
+/**
+ * Pre-check verdict for a submitted transaction's on-chain status.
+ *
+ * #379: this carries the FULL on-chain status instead of collapsing
+ * `confirmed` and `failed` into a single "found" value. The distinction
+ * matters: a transaction that was included in a ledger and FAILED is
+ * definitively dead and safe to replace with a new transaction, whereas a
+ * CONFIRMED transaction must never be re-submitted. Call sites branch on
+ * these values directly (no collapsing mapping at the call sites either).
+ */
+export type PreCheckResult = "confirmed" | "failed" | "not_found" | "network_error";
 
 export type PreCheckFn = (txHash: string) => Promise<PreCheckResult>;
 
@@ -195,11 +205,19 @@ export class ExecutionQueue {
     }
 
     // Pre-check guard: if there's a submitted hash and a pre-check function, verify
-    // transaction status before allowing retry (prevents blind resubmission)
+    // transaction status before allowing retry (prevents blind resubmission).
+    // #379: the pre-check now carries the FULL on-chain status. A CONFIRMED
+    // transaction must never be re-submitted (move to submitted so the
+    // reconciler can confirm it). A FAILED transaction is definitively dead,
+    // so a replacement transaction is safe — fall through to the re-queue
+    // path, which clears the old hash so the next attempt is a fresh
+    // transaction. `not_found` never landed, so it is safe the same way.
     if (existing.submittedHash && this.preCheck) {
       const preCheckResult = await this.preCheck(existing.submittedHash);
-      if (preCheckResult === "found") {
-        // Transaction exists on-chain — do not retry, move to submitted for reconciliation
+      if (preCheckResult === "confirmed") {
+        // Transaction CONFIRMED on-chain — do NOT re-submit; move to submitted
+        // so the reconciler confirms it and the operator is never offered a
+        // retry that would re-submit a confirmed transaction.
         await this.store.updateIfStatus(id, existing.status, {
           status: "submitted",
           txHash: existing.submittedHash,
@@ -214,7 +232,10 @@ export class ExecutionQueue {
         // Ambiguous — do not blind retry, preserve state
         return { status: "ambiguous_submission", execution: existing };
       }
-      // not_found — fall through to normal retry
+      // preCheckResult === "failed" or "not_found" — the transaction is
+      // definitively dead (failed on-chain) or never landed (not_found). Fall
+      // through to the re-queue path below, which clears the old hash so the
+      // next attempt builds a NEW transaction (#379).
     }
 
     const now = new Date().toISOString();
@@ -491,7 +512,9 @@ export class ExecutionQueue {
   /**
    * Evaluate retry decision with Horizon pre-check for ambiguous submissions.
    * Decision matrix:
-   * - submittedHash found on-chain → NO retry (transaction exists)
+   * - confirmed on-chain → NO retry (transaction succeeded; must not re-submit)
+   * - failed on-chain → retry under policy (transaction is definitively dead,
+   *   so a replacement transaction is safe — #379)
    * - network_error / ambiguous → NO blind retry (preserve state)
    * - definitive not_found → retry only if existing policy allows
    *
@@ -519,14 +542,20 @@ export class ExecutionQueue {
     }
 
     switch (preCheckResult) {
-      case "found":
-        // Transaction exists on-chain → do NOT retry, do NOT blind resubmit
+      case "confirmed":
+        // Transaction CONFIRMED on-chain → do NOT retry or re-submit
         return { shouldRetry: false, nextRetryAt: null };
       case "network_error":
         // Ambiguous network state → do NOT blind retry
         return { shouldRetry: false, nextRetryAt: null };
+      case "failed":
       case "not_found":
-        // Only definitive not_found allows retry under existing policy
+        // failed: the transaction was included in a ledger and FAILED — it is
+        //   definitively dead, so a replacement transaction is safe (#379). It
+        //   must NOT be dead-lettered solely because the previous attempt's
+        //   transaction exists on-chain in a failed state.
+        // not_found: the transaction never landed — resubmission is safe.
+        // Both retry only under the existing policy (classification + budget).
         if (classification === "permanent") {
           return { shouldRetry: false, nextRetryAt: null };
         }

@@ -17,6 +17,7 @@ import type { Signer } from "@4evergent/stellar";
 import { AgentScheduler } from "./scheduler.js";
 import { ScheduleExecutionService } from "./schedule-execution.js";
 import { ExecutionQueue } from "./execution-queue.js";
+import type { PreCheckFn } from "./execution-queue.js";
 import { ExecutionRecoveryService } from "./execution-recovery.js";
 import { ScheduleRecoveryService } from "./schedule-recovery.js";
 import { TransactionStatusReconciler, ApprovalRecoveryService, DEFAULT_SUBMITTED_MAX_AGE_MS } from "@4evergent/stellar";
@@ -434,14 +435,21 @@ export async function createApiServer(options: ServerOptions) {
     (options.dbPath ? new SQLiteExecutionStore(options.dbPath) : new InMemoryExecutionStore());
 
   // --- Execution recovery setup ---
-  const recoveryPreCheck = async (txHash: string) => {
-    const status = await adapter.getTransactionStatus(txHash);
-    if (status === "confirmed" || status === "failed") return "found" as const;
-    if (status === "not_found") return "not_found" as const;
-    return "network_error" as const;
-  };
+  // #379: ONE shared pre-check mapping, used by BOTH the execution queue
+  // (which covers the manual retry path) and the execution recovery service —
+  // no more duplicated three-line collapses. It carries the FULL on-chain
+  // transaction status through instead of collapsing `confirmed` and `failed`
+  // into a single "found" verdict. getTransactionStatus already distinguishes
+  // the cases (confirmed / failed / not_found / network_error), so the mapping
+  // is a direct passthrough and the call sites branch on the real status:
+  //   confirmed → never re-submit (move to submitted for reconciliation)
+  //   failed    → definitively dead, safe to retry with a NEW transaction
+  //   not_found → never landed, safe to retry
+  //   network_error → ambiguous, do not blind retry
+  const preCheck: PreCheckFn = (txHash: string) =>
+    adapter.getTransactionStatus(txHash);
   const recoveryService = new ExecutionRecoveryService(executionStore, {
-    preCheck: recoveryPreCheck,
+    preCheck,
   });
   let executionQueue: ExecutionQueue | null = null;
   let reconciler: import("@4evergent/stellar").TransactionStatusReconciler | null = null;
@@ -665,13 +673,9 @@ export async function createApiServer(options: ServerOptions) {
       });
     };
 
-    const preCheck = async (txHash: string) => {
-      const status = await adapter.getTransactionStatus(txHash);
-      if (status === "confirmed" || status === "failed") return "found" as const;
-      if (status === "not_found") return "not_found" as const;
-      return "network_error" as const;
-    };
-
+    // #379: reuse the shared pre-check mapping (defined above with the
+    // recovery service) — one mapping for the queue, the retry path, and the
+    // recovery service, carrying the full on-chain status through.
     executionQueue =
       options.executionQueue.instance ??
       new ExecutionQueue(executionStore, pipelineExecutor, getSourceAccount, {
@@ -1787,6 +1791,17 @@ export async function createApiServer(options: ServerOptions) {
     if (result.status === "invalid_state") return apiError(res, "INVALID_EXECUTION_STATE", { message: `cannot retry execution in status '${execution.status}'` });
     if (result.status === "max_retries_reached") return apiError(res, "MAX_RETRIES_REACHED", { message: `max retry attempts (${maxRetries}) reached` });
     if (result.status === "conflict") return apiError(res, "EXECUTION_CONFLICT");
+    // #379: pre-check carries the full on-chain status now. A confirmed
+    // transaction must never be re-submitted — retry() moves the record to
+    // "submitted" so the reconciler confirms it. An ambiguous network state
+    // must not trigger a blind re-submission either. Neither outcome is a
+    // "queued for retry" event, so they get distinct responses here.
+    if (result.status === "submitted") return apiError(res, "INVALID_EXECUTION_STATE", {
+      message: "execution transaction was confirmed on-chain; re-submission is not allowed",
+    });
+    if (result.status === "ambiguous_submission") return apiError(res, "EXECUTION_CONFLICT", {
+      message: "transaction status is ambiguous (network error); retry once Horizon is reachable",
+    });
 
     return json(res, { execution: result.execution, message: "execution queued for retry" });
   }
